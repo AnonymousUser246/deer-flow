@@ -427,22 +427,66 @@ from deerflow.community.tavily import tavily_search
 
 ---
 
-## 5. 结论
+## 5. 隐式 Graph vs 显式 Graph：如何选择
 
-| 维度 | 纯 DeerFlow | 纯 LangGraph | LangGraph + DeerFlow 组件（推荐） |
-|------|-------------|-------------|-------------------------------|
-| Graph 控制力 | 低（隐式 graph） | 高 | 高 |
-| 开发速度 | 中（改太多） | 中（要造轮子） | 快（两头借力） |
+### 5.1 什么是隐式 Graph
+
+DeerFlow 使用 `langchain.agents.create_agent` 创建 agent，这个 API 内部自动生成一个 ReAct loop 拓扑的 StateGraph：
+
+```
+START → LLM → 有 tool call? → 是 → 执行 tool → LLM → ... → 否 → END
+```
+
+开发者不需要写 `add_node`、`add_edge`，graph 是框架自动生成的，因此称为"隐式 graph"。
+所有领域特定的逻辑（阶段控制、回退策略等）都放在 **system prompt** 和 **tools** 中，由 LLM 自主决定执行顺序。
+
+### 5.2 显式 Graph
+
+使用 LangGraph 的 `StateGraph` API 手动定义节点和边：
+
+```python
+sg = StateGraph(MyState)
+sg.add_node("explore", explore_fn)
+sg.add_node("edit", edit_fn)
+sg.add_node("verify", verify_fn)
+sg.add_edge("explore", "edit")
+sg.add_conditional_edges("verify", check_result, {"pass": END, "fail": "edit"})
+```
+
+阶段顺序和回退条件由代码硬编码，LLM 只在每个节点内部有自由度。
+
+### 5.3 选择建议
+
+| 维度 | 隐式 graph (create_agent) | 显式 graph (StateGraph) |
+|------|--------------------------|----------------------|
+| 阶段顺序的**软保证**（靠 prompt） | 可以 | 可以 |
+| 阶段顺序的**硬保证**（代码强制） | 做不到 | 可以 |
+| 阶段之间的**条件回退** | LLM 自行判断 | 代码精确控制 |
+| 并行 Subagent | `task` tool 并发上限 3 | `Send()` 无限制 |
+| 每个阶段用**不同 tools/prompt** | 不行，共享同一套 | 可以，每个 node 绑定不同配置 |
+| **开发速度** | 快（只写 prompt + tools） | 慢（需要设计 state、节点、边） |
+
+**推荐策略**：先用隐式 graph 做 MVP（把阶段控制放在 prompt 中），如果发现 LLM 经常跳步或不遵循流程，再升级到显式 StateGraph。这也是 Claude Code、Cursor Agent、Devin 等主流 coding agent 的做法。
+
+---
+
+## 6. 结论
+
+| 维度 | 纯 DeerFlow (隐式 graph) | 纯 LangGraph (显式 graph) | LangGraph + DeerFlow 组件 |
+|------|------------------------|--------------------------|--------------------------|
+| Graph 控制力 | 低（prompt 软控制） | 高（代码硬控制） | 高 |
+| 开发速度 | **最快**（只写 prompt + tools） | 慢（要造轮子） | 中 |
 | Memory 灵活度 | 低 | 高 | 高 |
-| 基础设施成熟度 | 高 | 低 | 高（复用 DeerFlow 的） |
-| 维护成本 | 高（fork 维护） | 中 | 低（松耦合） |
+| 基础设施成熟度 | 高 | 低 | 高 |
+| 维护成本 | 低（不改 DeerFlow） | 中 | 中 |
+| 阶段硬保证 | 无 | 有 | 有 |
 
-**最终推荐：方案 C — LangGraph 手写核心 graph + 选择性复用 DeerFlow 的 sandbox/models/config/checkpointer。**
+### 推荐策略：渐进式
 
-理由：
-1. 你的场景需要精确的 graph 拓扑控制（多阶段流水线 + 条件回退 + 并行 dispatch），这是 DeerFlow 的隐式 graph 做不到的
-2. 你的 memory 是三层结构化数据，不是 DeerFlow 的 facts/context 模型
-3. 但 DeerFlow 的 sandbox、model factory、config 是高质量的基础设施，不需要重造
-4. 这种方式是松耦合的 —— 你 `import deerflow.sandbox` 即可，不需要 fork 维护整个 DeerFlow
+**Phase 0（MVP）**：直接用 DeerFlow 的 `create_agent` 隐式 graph。把三阶段流水线的逻辑全部放在 system prompt 和 tools 里，利用 DeerFlow 现成的 sandbox、subagent、model factory。Memory 层新写一个自定义的 `MemoryStorage` 实现。这是最快出 MVP 的方式。
 
-核心工作量集中在：graph 定义（~500行）、memory 模块（~400行）、领域 tools（~600行）、节点实现（~800行），总计约 2300 行 Python，其中不包含 DeerFlow 已覆盖的 sandbox/model/config 基础设施。
+**Phase 1（如果需要）**：如果发现 LLM 不遵循阶段流程（跳步、遗漏验证），则将 subagent 的内部逻辑改为手写 StateGraph，同时继续复用 DeerFlow 的 sandbox/model/config 基础设施。
+
+**Phase 2（如果需要）**：如果需要超过 3 个 subagent 并行，或需要每个阶段绑定不同的 tools/prompt，则升级为完整的 LangGraph 显式 graph + DeerFlow 组件复用方案。
+
+这种渐进式方法避免了一开始过度工程化，同时保留了后续升级的路径。
